@@ -713,12 +713,77 @@ typedef enum {
 	FLAC_SUBFRAME_RICE_VERBATIM = 512,
 	FLAC_SUBFRAME_RICE_FINALIZE = 513,
 	FLAC_SUBFRAME_VERBATIM = 514,
-	FLAC_SUBFRAME_FINALIZE = 515
+	FLAC_SUBFRAME_FINALIZE = 515,
+	FLAC_FRAME_TAIL = 516
 } fx_flac_private_state_t;
 
 /******************************************************************************
  * Internal structs                                                           *
  ******************************************************************************/
+
+/**
+ * State slot grouping all transient state belonging to the frame that is
+ * currently being decoded. The entire slot is reset in one go whenever the
+ * decoder locks onto a new frame (see _fx_flac_frame_state_reset()). This
+ * guarantees that no checksum or cursor state can leak across frame
+ * boundaries -- in particular when a frame happens to be split across
+ * multiple input buffers passed to fx_flac_process().
+ */
+typedef struct {
+	/**
+	 * Checksum computed while reading the frame header.
+	 */
+	uint8_t crc8;
+
+	/**
+	 * Checksum of the entire frame. Verified against the CRC16 stored in
+	 * the frame trailer once the frame has been decoded.
+	 */
+	uint16_t crc16;
+
+	/**
+	 * Current channel. This is reset at frame boundaries.
+	 */
+	uint8_t chan_cur;
+
+	/**
+	 * Cursor into the current block buffer.
+	 */
+	uint16_t blk_cur;
+} fx_flac_frame_state_t;
+
+/**
+ * State slot grouping all transient residual-decoding state belonging to the
+ * subframe that is currently being decoded (Rice partition cursors, unary
+ * quotient counter, LPC coefficient cursor). The entire slot is reset in one
+ * go whenever the decoder enters a new subframe header (see
+ * _fx_flac_residual_state_reset()), so partially consumed residual state from
+ * a previous subframe -- or from a frame that was aborted due to an input
+ * buffer boundary or a resynchronisation -- can never be mistaken for valid
+ * state.
+ */
+typedef struct {
+	/**
+	 * Current coefficient.
+	 */
+	uint8_t coef_cur;
+
+	/**
+	 * Current rice partition.
+	 */
+	uint16_t partition_cur;
+
+	/**
+	 * Current sample index in the current rice partition (decremented to
+	 * zero).
+	 */
+	uint16_t partition_sample;
+
+	/**
+	 * Current rice partition unary quotient counter.
+	 */
+	uint16_t rice_unary_counter;
+} fx_flac_residual_state_t;
 
 /**
  * Private definition of the fx_flac structure.
@@ -755,45 +820,14 @@ struct fx_flac {
 	uint8_t max_channels;
 
 	/**
-	 * Current coefficient.
+	 * Slot holding all transient per-frame state (checksums, cursors).
 	 */
-	uint8_t coef_cur;
+	fx_flac_frame_state_t frame;
 
 	/**
-	 * Current rice partition.
+	 * Slot holding all transient per-subframe residual decoding state.
 	 */
-	uint16_t partition_cur;
-
-	/**
-	 * Current sample index in the current rice partition (decremented to zero).
-	 */
-	uint16_t partition_sample;
-
-	/**
-	 * Current rice partition unary quotient counter.
-	 */
-	uint16_t rice_unary_counter;
-
-	/**
-	 * Current channel. This is reset at frame boundaries.
-	 */
-	uint8_t chan_cur;
-
-	/**
-	 * Pointer into the current block buffer.
-	 */
-	uint16_t blk_cur;
-
-	/**
-	 * Variable holding the checksum computed when reading the frame_header.
-	 */
-	uint8_t crc8;
-
-	/**
-	 * Variable holding the checksum of an entire frame. If this checksum does
-	 * not match after decoding a frame, the entire frame is rejected.
-	 */
-	uint16_t crc16;
+	fx_flac_residual_state_t residual;
 
 	/**
 	 * Flag indicating whether the current metadata block is the last metadata
@@ -839,6 +873,38 @@ static bool _fx_flac_check_params(uint16_t max_block_size,
                                   uint8_t max_channels) {
 	return (max_block_size > 0U) && (max_channels > 0U) &&
 	       (max_channels <= FLAC_MAX_CHANNEL_COUNT);
+}
+
+/******************************************************************************
+ * State slot management                                                      *
+ ******************************************************************************/
+
+/**
+ * Resets the entire per-frame state slot. Called whenever the decoder locks
+ * onto a new frame, ensuring that checksums and cursors from a previous (or
+ * aborted) frame cannot leak into the new frame.
+ *
+ * @param fs is the frame state slot that should be reset.
+ */
+static inline void _fx_flac_frame_state_reset(fx_flac_frame_state_t *fs) {
+	fs->crc8 = 0U;
+	fs->crc16 = 0U;
+	fs->chan_cur = 0U;
+	fs->blk_cur = 0U;
+}
+
+/**
+ * Resets the entire per-subframe residual decoding state slot. Called
+ * whenever the decoder enters a new subframe header, ensuring that partially
+ * consumed Rice/LPC state from a previous subframe is never reused.
+ *
+ * @param rs is the residual state slot that should be reset.
+ */
+static inline void _fx_flac_residual_state_reset(fx_flac_residual_state_t *rs) {
+	rs->coef_cur = 0U;
+	rs->partition_cur = 0U;
+	rs->partition_sample = 0U;
+	rs->rice_unary_counter = 0U;
 }
 
 /******************************************************************************
@@ -1081,13 +1147,13 @@ static const uint16_t fx_flac_crc16_table_[256] = {
 
 static inline void _fx_flac_crc8_(uint8_t byte, void *data) {
 	fx_flac_t *inst = (fx_flac_t *)FX_ASSUME_ALIGNED(data);
-	inst->crc8 = fx_flac_crc8_table_[inst->crc8 ^ byte];
+	inst->frame.crc8 = fx_flac_crc8_table_[inst->frame.crc8 ^ byte];
 }
 
 static inline void _fx_flac_crc16_(uint8_t byte, void *data) {
 	fx_flac_t *inst = (fx_flac_t *)FX_ASSUME_ALIGNED(data);
-	const uint8_t i = ((inst->crc16 >> 8U) ^ byte) & 0xFF;
-	inst->crc16 = fx_flac_crc16_table_[i] ^ (inst->crc16 << 8U);
+	const uint8_t i = ((inst->frame.crc16 >> 8U) ^ byte) & 0xFF;
+	inst->frame.crc16 = fx_flac_crc16_table_[i] ^ (inst->frame.crc16 << 8U);
 }
 
 static inline void _fx_flac_double_crc_(uint8_t byte, void *data) {
@@ -1319,8 +1385,10 @@ static bool _fx_flac_process_search_frame(fx_flac_t *inst) {
 				READ_BITS(8U); /* Next byte (assume frames are byte aligned). */
 				return true;
 			} else {
-				inst->crc8 = 0U; /* Reset the checksums */
-				inst->crc16 = 0U;
+				/* Found a frame sync code. Reset the entire per-frame state
+				   slot (checksums and cursors); no state from a previous
+				   frame may leak into the new frame. */
+				_fx_flac_frame_state_reset(&inst->frame);
 				inst->priv_state = FLAC_FRAME_HEADER;
 				READ_BITS_FAST_DCRC(15U);
 			}
@@ -1404,7 +1472,7 @@ static bool _fx_flac_process_search_frame(fx_flac_t *inst) {
 			   searching. */
 			fh->crc8 = READ_BITS_CRC(8U);
 #ifndef FX_FLAC_NO_CRC
-			if (fh->crc8 != inst->crc8) {
+			if (fh->crc8 != inst->frame.crc8) {
 				return _fx_flac_handle_err(inst);
 			}
 #endif
@@ -1418,7 +1486,7 @@ static bool _fx_flac_process_search_frame(fx_flac_t *inst) {
 			/* Decode the subframes */
 			inst->state = FLAC_IN_FRAME;
 			inst->priv_state = FLAC_SUBFRAME_HEADER;
-			inst->chan_cur = 0U; /* Start with the first channel */
+			inst->frame.chan_cur = 0U; /* Start with the first channel */
 			break;
 		default:
 			return _fx_flac_handle_err(inst);
@@ -1426,19 +1494,94 @@ static bool _fx_flac_process_search_frame(fx_flac_t *inst) {
 	return true;
 }
 
+/**
+ * Processes the tail of the current frame: synchronises with the underlying
+ * byte stream, reads and verifies the CRC16 checksum stored in the frame
+ * trailer, applies stereo decorrelation and shifts the samples such that the
+ * full 32-bit output range is used. Finally resets the block/channel cursors
+ * and transitions to FLAC_DECODED_FRAME.
+ *
+ * This function is the single place in which a frame is completed; it is
+ * executed once per frame after the last subframe has been decoded. Like all
+ * state handlers it is re-entrant: if the input buffer is exhausted while
+ * reading the frame trailer (i.e. the frame tail is split across two input
+ * buffers), the function simply returns "false" and is re-entered once more
+ * data is available, with all intermediate state held in the per-frame state
+ * slot.
+ *
+ * @param inst is the FLAC decoder instance.
+ * @return false if more input data is needed or an error occurred, true if
+ * the frame tail has been processed successfully.
+ */
+static bool _fx_flac_finalize_frame(fx_flac_t *inst) {
+	int64_t tmp_; /* Used by the READ_BITS macro */
+	fx_flac_frame_header_t *fh = inst->frame_header;
+	const uint32_t blk_n = fh->block_size;
+
+	/* Synchronise with the underlying byte stream */
+	SYNC_BYTESTREAM_CRC();
+
+	/* Read the CRC16 sum, resync if it doesn't match our own */
+	uint16_t crc16 = READ_BITS(16U);
+#ifndef FX_FLAC_NO_CRC
+	if (crc16 != inst->frame.crc16) {
+		return _fx_flac_handle_err(inst);
+	}
+#else
+	(void)crc16;
+#endif
+
+	/* Post process side-stereo */
+	int32_t *c1 = inst->blkbuf[0], *c2 = inst->blkbuf[1];
+	switch (fh->channel_assignment) {
+		case LEFT_SIDE_STEREO:
+			_fx_flac_post_process_left_side(c1, c2, blk_n);
+			break;
+		case RIGHT_SIDE_STEREO:
+			_fx_flac_post_process_right_side(c1, c2, blk_n);
+			break;
+		case MID_SIDE_STEREO:
+			_fx_flac_post_process_mid_side(c1, c2, blk_n);
+			break;
+		default:
+			break;
+	}
+
+	/* Shift the output such that the resulting int32 stream can be
+	   played back. */
+	uint8_t shift = 32U - fh->sample_size;
+	if (shift) {
+		for (uint8_t c = 0U; c < fh->channel_count; c++) {
+			int32_t *blk = inst->blkbuf[c];
+			for (uint16_t i = 0U; i < blk_n; i++) {
+				blk[i] = blk[i] * (1 << shift);
+			}
+		}
+	}
+
+	/* We're done decoding this frame! Notify the outer loop! */
+	inst->frame.blk_cur = 0U;  /* Reset the read cursor */
+	inst->frame.chan_cur = 0U; /* Reset the channel cursor */
+	inst->state = FLAC_DECODED_FRAME;
+	return true;
+}
+
 static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 	int64_t tmp_; /* Used by the READ_BITS macro */
 	fx_flac_frame_header_t *fh = inst->frame_header;
 	fx_flac_subframe_header_t *sfh = inst->subframe_header;
-	int32_t *blk = inst->blkbuf[inst->chan_cur % FLAC_MAX_CHANNEL_COUNT];
+	int32_t *blk = inst->blkbuf[inst->frame.chan_cur % FLAC_MAX_CHANNEL_COUNT];
 	const uint32_t blk_n = fh->block_size;
 
 	/* Figure out the number of bits to read for sample. This depends on the
 	   channel assignment. */
 	uint8_t bps = fh->sample_size - sfh->wasted_bits;
-	if ((fh->channel_assignment == LEFT_SIDE_STEREO && inst->chan_cur == 1) ||
-	    (fh->channel_assignment == RIGHT_SIDE_STEREO && inst->chan_cur == 0) ||
-	    (fh->channel_assignment == MID_SIDE_STEREO && inst->chan_cur == 1)) {
+	if ((fh->channel_assignment == LEFT_SIDE_STEREO &&
+	     inst->frame.chan_cur == 1) ||
+	    (fh->channel_assignment == RIGHT_SIDE_STEREO &&
+	     inst->frame.chan_cur == 0) ||
+	    (fh->channel_assignment == MID_SIDE_STEREO &&
+	     inst->frame.chan_cur == 1)) {
 		bps++;
 	}
 
@@ -1453,9 +1596,12 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 		case FLAC_SUBFRAME_HEADER: {
 			ENSURE_BITS(40U);
 
-			/* Reset the block write cursor, make sure initial blk sample is set
-			   to zero for zero-order fixed LPC */
-			inst->blk_cur = 0U;
+			/* Reset the block write cursor and the entire residual decoding
+			   state slot; no Rice/LPC state from a previous subframe may leak
+			   into this subframe. Also make sure the initial blk sample is
+			   set to zero for zero-order fixed LPC. */
+			inst->frame.blk_cur = 0U;
+			_fx_flac_residual_state_reset(&inst->residual);
 			blk[0U] = 0U;
 
 			/* Read a zero padding bit. This must be zero. */
@@ -1528,10 +1674,11 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 		case FLAC_SUBFRAME_LPC: {
 			/* Either just read up to "order" samples, or the entire block */
 			const uint32_t n = (sfh->type == SFT_VERBATIM) ? blk_n : sfh->order;
-			while (inst->blk_cur < n) {
-				blk[inst->blk_cur] = READ_BITS_CRC(bps);
-				blk[inst->blk_cur] = SIGN_EXTEND(blk[inst->blk_cur], bps);
-				inst->blk_cur++;
+			while (inst->frame.blk_cur < n) {
+				blk[inst->frame.blk_cur] = READ_BITS_CRC(bps);
+				blk[inst->frame.blk_cur] =
+				    SIGN_EXTEND(blk[inst->frame.blk_cur], bps);
+				inst->frame.blk_cur++;
 			}
 			inst->priv_state =
 			    (fx_flac_private_state_t)((int)inst->priv_state + 1U);
@@ -1550,17 +1697,18 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 			if (sfh->lpc_shift < 0) {
 				return _fx_flac_handle_err(inst);
 			}
-			inst->coef_cur = 0U;
+			/* coef_cur was reset with the residual state slot when the
+			   subframe header was entered. */
 			inst->priv_state = FLAC_SUBFRAME_LPC_COEFFS;
 			break;
 		}
 		case FLAC_SUBFRAME_LPC_COEFFS:
 			/* Read the individual predictor coefficients */
-			while (inst->coef_cur < sfh->order) {
+			while (inst->residual.coef_cur < sfh->order) {
 				uint32_t coef = READ_BITS_CRC(sfh->lpc_prec);
-				sfh->lpc_coeffs[inst->coef_cur] =
+				sfh->lpc_coeffs[inst->residual.coef_cur] =
 				    SIGN_EXTEND(coef, sfh->lpc_prec);
-				inst->coef_cur++;
+				inst->residual.coef_cur++;
 			}
 			inst->priv_state = FLAC_SUBFRAME_LPC_RESIDUAL;
 			break;
@@ -1575,7 +1723,8 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 				return _fx_flac_handle_err(inst);
 			}
 			sfh->rice_partition_order = READ_BITS_FAST_CRC(4U);
-			inst->partition_cur = 0U;
+			/* partition_cur was reset with the residual state slot when the
+			   subframe header was entered. */
 			inst->priv_state = FLAC_SUBFRAME_RICE_INIT;
 			break;
 		}
@@ -1590,23 +1739,24 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 				inst->priv_state = FLAC_SUBFRAME_RICE_VERBATIM;
 			} else {
 				inst->priv_state = FLAC_SUBFRAME_RICE_UNARY;
-				inst->rice_unary_counter = 0U;
+				inst->residual.rice_unary_counter = 0U;
 			}
 
 			/* Compute the number of samples to read */
-			inst->partition_sample = blk_n >> sfh->rice_partition_order;
-			if (inst->partition_cur == 0U) {
+			inst->residual.partition_sample = blk_n >> sfh->rice_partition_order;
+			if (inst->residual.partition_cur == 0U) {
 				/* First partition alread includes verbatim samples */
-				if (inst->partition_sample < sfh->order) {
+				if (inst->residual.partition_sample < sfh->order) {
 					return _fx_flac_handle_err(
 					    inst); /* Number of samples is negative */
 				}
-				inst->partition_sample -= sfh->order;
+				inst->residual.partition_sample -= sfh->order;
 			}
 
 			/* Make sure we're never writing beyond the buffer for this
 			   channel */
-			if ((inst->partition_sample + inst->blk_cur) > blk_n) {
+			if ((inst->residual.partition_sample + inst->frame.blk_cur) >
+			    blk_n) {
 				return _fx_flac_handle_err(inst);
 			}
 			break;
@@ -1614,7 +1764,7 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 		case FLAC_SUBFRAME_RICE:
 		case FLAC_SUBFRAME_RICE_UNARY:
 			/* Read the individual rice samples */
-			while (inst->partition_sample > 0U) {
+			while (inst->residual.partition_sample > 0U) {
 				/* Read the unary part of the Rice encoded sample bit-by-bit */
 				if (inst->priv_state == FLAC_SUBFRAME_RICE_UNARY) {
 					while (true) {
@@ -1622,7 +1772,7 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 						if (bit) {
 							break;
 						}
-						inst->rice_unary_counter++;
+						inst->residual.rice_unary_counter++;
 					}
 				}
 
@@ -1635,40 +1785,42 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 				if (sfh->rice_parameter > 0U) {
 					r = READ_BITS_CRC(sfh->rice_parameter);
 				}
-				const uint16_t q = inst->rice_unary_counter;
+				const uint16_t q = inst->residual.rice_unary_counter;
 				const uint32_t val = (q << sfh->rice_parameter) | r;
 
 				/* Last bit determines sign */
 				if (val & 1) {
-					blk[inst->blk_cur] = -((int32_t)(val >> 1)) - 1;
+					blk[inst->frame.blk_cur] = -((int32_t)(val >> 1)) - 1;
 				} else {
-					blk[inst->blk_cur] = (int32_t)(val >> 1);
+					blk[inst->frame.blk_cur] = (int32_t)(val >> 1);
 				}
 
 				/* Read the next sample */
-				inst->rice_unary_counter = 0U;
+				inst->residual.rice_unary_counter = 0U;
 				inst->priv_state = FLAC_SUBFRAME_RICE_UNARY;
-				inst->blk_cur++;
-				inst->partition_sample--;
+				inst->frame.blk_cur++;
+				inst->residual.partition_sample--;
 			}
 			inst->priv_state = FLAC_SUBFRAME_RICE_FINALIZE;
 			break;
 		case FLAC_SUBFRAME_RICE_VERBATIM: {
 			/* Samples are encoded in verbatim in this partition */
 			const uint8_t bps = sfh->rice_parameter;
-			while (inst->partition_sample > 0U) {
-				blk[inst->blk_cur] = (bps == 0) ? 0U : READ_BITS_CRC(bps);
-				blk[inst->blk_cur] = SIGN_EXTEND(blk[inst->blk_cur], bps);
-				inst->blk_cur++;
-				inst->partition_sample--;
+			while (inst->residual.partition_sample > 0U) {
+				blk[inst->frame.blk_cur] = (bps == 0) ? 0U : READ_BITS_CRC(bps);
+				blk[inst->frame.blk_cur] =
+				    SIGN_EXTEND(blk[inst->frame.blk_cur], bps);
+				inst->frame.blk_cur++;
+				inst->residual.partition_sample--;
 			}
 			inst->priv_state = FLAC_SUBFRAME_RICE_FINALIZE;
 			break;
 		}
 		case FLAC_SUBFRAME_RICE_FINALIZE:
 			/* Go to the next partition or finalize this subframe */
-			inst->partition_cur++;
-			if (inst->partition_cur == (1U << sfh->rice_partition_order)) {
+			inst->residual.partition_cur++;
+			if (inst->residual.partition_cur ==
+			    (1U << sfh->rice_partition_order)) {
 				/* Decode the residual */
 				_fx_flac_restore_lpc_signal(blk, blk_n, sfh->lpc_coeffs,
 				                            sfh->order, sfh->lpc_shift);
@@ -1678,6 +1830,10 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 			}
 			break;
 		case FLAC_SUBFRAME_FINALIZE: {
+			/* Note: this state must not perform any failable reads; it is
+			   not re-entrant. All failable frame-tail processing happens in
+			   the dedicated FLAC_FRAME_TAIL state below. */
+
 			/* Apply the wasted bits transformation */
 			if (sfh->wasted_bits) {
 				uint8_t shift = sfh->wasted_bits;
@@ -1687,59 +1843,20 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 			}
 
 			/* There is another subframe to read, continue! */
-			inst->chan_cur++; /* Go to the next channel */
-			if (inst->chan_cur < fh->channel_count) {
+			inst->frame.chan_cur++; /* Go to the next channel */
+			if (inst->frame.chan_cur < fh->channel_count) {
 				inst->priv_state = FLAC_SUBFRAME_HEADER;
 				break;
 			}
 
-			/* Synchronise with the underlying byte stream */
-			SYNC_BYTESTREAM_CRC();
-
-			/* Read the CRC16 sum, resync if it doesn't match our own */
-			uint16_t crc16 = READ_BITS(16U);
-#ifndef FX_FLAC_NO_CRC
-			if (crc16 != inst->crc16) {
-				return _fx_flac_handle_err(inst);
-			}
-#else
-			(void)crc16;
-#endif
-
-			/* Post process side-stereo */
-			int32_t *c1 = inst->blkbuf[0], *c2 = inst->blkbuf[1];
-			switch (fh->channel_assignment) {
-				case LEFT_SIDE_STEREO:
-					_fx_flac_post_process_left_side(c1, c2, blk_n);
-					break;
-				case RIGHT_SIDE_STEREO:
-					_fx_flac_post_process_right_side(c1, c2, blk_n);
-					break;
-				case MID_SIDE_STEREO:
-					_fx_flac_post_process_mid_side(c1, c2, blk_n);
-					break;
-				default:
-					break;
-			}
-
-			/* Shift the output such that the resulting int32 stream can be
-			   played back. */
-			uint8_t shift = 32U - fh->sample_size;
-			if (shift) {
-				for (uint8_t c = 0U; c < fh->channel_count; c++) {
-					int32_t *blk = inst->blkbuf[c];
-					for (uint16_t i = 0U; i < blk_n; i++) {
-						blk[i] = blk[i] * (1 << shift);
-					}
-				}
-			}
-
-			/* We're done decoding this frame! Notify the outer loop! */
-			inst->blk_cur = 0U; /* Reset the read cursor */
-			inst->chan_cur = 0U;
-			inst->state = FLAC_DECODED_FRAME;
+			/* This was the last subframe of this frame; process the frame
+			   tail (byte alignment, CRC16, stereo decorrelation, output
+			   scaling) in the dedicated, re-entrant frame tail state. */
+			inst->priv_state = FLAC_FRAME_TAIL;
 			break;
 		}
+		case FLAC_FRAME_TAIL:
+			return _fx_flac_finalize_frame(inst);
 		default:
 			inst->state = FLAC_ERR;
 			break;
@@ -1755,7 +1872,8 @@ static bool _fx_flac_process_decoded_frame(fx_flac_t *inst, int32_t *out,
 	/* Fetch channel count and number of samples left to write */
 	const uint8_t cc = fh->channel_count;
 	uint32_t n_smpls_rem =
-	    (fh->block_size - inst->blk_cur - 1U) * cc + (cc - inst->chan_cur);
+	    (fh->block_size - inst->frame.blk_cur - 1U) * cc +
+	    (cc - inst->frame.chan_cur);
 
 	/* Truncate to the actually available space. */
 	if (n_smpls_rem > *out_len) {
@@ -1766,13 +1884,13 @@ static bool _fx_flac_process_decoded_frame(fx_flac_t *inst, int32_t *out,
 	uint32_t tar = 0U; /* Number of samples written. */
 	while (tar < n_smpls_rem) {
 		/* Write to the output buffer */
-		out[tar] = inst->blkbuf[inst->chan_cur][inst->blk_cur];
+		out[tar] = inst->blkbuf[inst->frame.chan_cur][inst->frame.blk_cur];
 
 		/* Advance the read and write cursors */
-		inst->chan_cur++;
-		if (inst->chan_cur == cc) {
-			inst->chan_cur = 0U;
-			inst->blk_cur++;
+		inst->frame.chan_cur++;
+		if (inst->frame.chan_cur == cc) {
+			inst->frame.chan_cur = 0U;
+			inst->frame.blk_cur++;
 		}
 		tar++;
 	}
@@ -1781,7 +1899,7 @@ static bool _fx_flac_process_decoded_frame(fx_flac_t *inst, int32_t *out,
 	*out_len = tar;
 
 	/* We're done with this frame! */
-	if (inst->blk_cur == fh->block_size) {
+	if (inst->frame.blk_cur == fh->block_size) {
 		inst->state = FLAC_END_OF_FRAME;
 		return true;
 	}
@@ -1883,13 +2001,10 @@ void fx_flac_reset(fx_flac_t *inst) {
 	inst->state = FLAC_INIT;
 	inst->priv_state = FLAC_SYNC_INIT;
 	inst->n_bytes_rem = 0U;
-	inst->crc8 = 0U;
-	inst->coef_cur = 0U;
-	inst->partition_cur = 0U;
-	inst->partition_sample = 0U;
-	inst->rice_unary_counter = 0U;
-	inst->chan_cur = 0U;
-	inst->blk_cur = 0U;
+
+	/* Reset the per-frame and per-subframe state slots */
+	_fx_flac_frame_state_reset(&inst->frame);
+	_fx_flac_residual_state_reset(&inst->residual);
 }
 
 fx_flac_state_t fx_flac_get_state(const fx_flac_t *inst) {

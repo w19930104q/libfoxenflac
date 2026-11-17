@@ -23,10 +23,19 @@ endif
 # Include directory
 inc_foxen = include_directories('src')
 
+# Compile-time assertion on the maximum stack usage of the decoder. The
+# decoder does not recurse and its largest stack frame is far below this
+# bound; the flag makes the build fail should that ever change.
+lib_foxenflac_args = []
+if compiler.has_argument('-Wstack-usage=1024')
+    lib_foxenflac_args += '-Wstack-usage=1024'
+endif
+
 # Define the contents of the actual library
 lib_foxenflac = library(
     'foxenflac',
     'src/foxen-flac.c',
+    c_args: lib_foxenflac_args,
     include_directories: inc_foxen,
     install: true)
 
@@ -78,6 +87,25 @@ test(
     'test_flac_integration_afl_rice_parameter_zero',
     exe_test_flac_integration,
     args: [join_paths(meson.project_source_root(), 'test/data/afl_rice_parameter_zero.flac')])
+
+# Sliced-decoding, CRC, stack-usage and consecutive-decode tests
+exe_test_flac_slicing = executable(
+    'test_flac_slicing',
+    'test/test_flac_slicing.c',
+    include_directories: inc_foxen,
+    link_with: lib_foxenflac,
+    install: false)
+foreach f : [
+        'noise',
+        'wasted_bits',
+        'short',
+        'subframe_header_reset',
+        'afl_rice_parameter_zero']
+    test(
+        'test_flac_slicing_' + f,
+        exe_test_flac_slicing,
+        args: [join_paths(meson.project_source_root(), 'test/data/' + f + '.flac')])
+endforeach
 
 exe_python = find_program('python3')
 test(
